@@ -1,0 +1,38 @@
+# Runs the test suite on Linux and Windows for every push and pull request.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11"]
+    env:
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # Tests create git repositories, which need an identity.
+      - name: Git identity
+        run: |
+          git config --global user.email ci@example.invalid
+          git config --global user.name ci
+      - name: Install
+        run: uv sync --extra dev --extra tui
+      - name: Test
+        run: uv run pytest -q -n auto

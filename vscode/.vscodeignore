@@ -1,0 +1,8 @@
+**
+!package.json
+!README.md
+!dist/extension.cjs
+!media/main.js
+!media/main.css
+!media/icon.svg
+!media/icon.png

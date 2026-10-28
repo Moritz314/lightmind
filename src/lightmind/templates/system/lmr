@@ -1,0 +1,3 @@
+#!/bin/sh
+# Resume a chat: `lmr` does the same as `lm resume` (a list of the last chats, or a name or id, or --last).
+exec "$(dirname "$0")/lm" resume "$@"

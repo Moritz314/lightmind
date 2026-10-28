@@ -1,0 +1,344 @@
+#!/bin/sh
+# Lightmind launcher for Linux and macOS. POSIX sh, LF line ends.
+#
+# It lives in system/, the technical folder of the tree. The folder above it is the tree
+# (LIGHTMIND_HOME). Everything this script builds or downloads stays inside system/.
+#
+#   system/lm ARGS    start Lightmind; builds the runtime on the first start
+#   system/lm build   only prepare the runtime (build it when a new version is pending), start nothing
+#   system/lm path    print the line that puts this folder on your PATH (writes no file)
+#
+# Runtimes (Python and lightmind with its terminal UI) live side by side: system/runtimes/OS-ARCH/rN is one build,
+# the one-line file system/runtimes/OS-ARCH.current names the runtime that new starts use. A build goes into a folder
+# of its own and the pointer is switched only when it stands complete, so a window that still runs an older runtime
+# is never disturbed; it stays on its version until it ends. Every start holds a shared flock on lm-use.lock of
+# its runtime for as long as lm runs (the exec'd lm inherits the file); a runtime folder that is not the current one
+# and whose lock can be taken exclusively is in nobody's use and is removed at the next start. Without the flock
+# program (macOS) old runtimes are kept. A new version is pending when system/state/runtime-stamp.txt (written by
+# lm update) differs from lm-stamp.txt inside the runtime, or when the tree was moved (lm-root.txt). A start where
+# nothing changed does not run uv at all. The runtime of earlier launchers, system/runtime-OS-ARCH, is run as long as
+# it is current and is removed once a new runtime exists and no process runs from it.
+# This file is replaced by lm update through a temp file and a rename: a running shell keeps reading the old one.
+# Overrides: LM_UV names another uv program, LM_PYTHON another Python version (3.12), LM_LOCK_WAIT how
+# many seconds a start waits for a build running in another window when it has no runtime to start (300).
+
+lm_self=$0
+while [ -L "$lm_self" ]; do                      # the launcher may be linked into a bin folder
+  lm_dir=$(cd "$(dirname "$lm_self")" && pwd)
+  lm_self=$(readlink "$lm_self")
+  case $lm_self in /*) ;; *) lm_self=$lm_dir/$lm_self ;; esac
+done
+LM_SYS=$(cd "$(dirname "$lm_self")" && pwd -P) || exit 1
+LM_HOME=$(dirname "$LM_SYS")
+
+if [ "${1:-}" = path ]; then
+  q=$(printf '%s' "$LM_SYS" | sed 's/[\\"$`]/\\&/g')
+  printf 'To use lm in any terminal, add this line to ~/.profile (or the startup file of your shell):\n\n  export PATH="%s:$PATH"\n\n' "$q"
+  exit 0
+fi
+
+case "$(uname -s)" in Darwin) os=macos ;; *) os=linux ;; esac
+case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; *) arch=x86_64 ;; esac
+LM_BIN=$LM_SYS/bin
+rts=$LM_SYS/runtimes/$os-$arch
+ptr=$rts.current
+legacy=$LM_SYS/runtime-$os-$arch
+stampf=$LM_SYS/state/runtime-stamp.txt
+only=
+[ "${1:-}" = build ] && [ $# -eq 1 ] && only=1
+
+# The portable environment: the same values as Home.runtime_env() and its siblings. system/bin goes
+# LAST on PATH: a file dropped there must never shadow a system program (git, bash, python). This
+# script calls its uv by the full path, so nothing depends on the position.
+export LIGHTMIND_HOME="$LM_HOME"
+export UV_CACHE_DIR="$LM_SYS/cache"
+export UV_PYTHON_INSTALL_DIR="$LM_SYS/python"
+export UV_PYTHON_INSTALL_BIN=0
+export UV_PYTHON_INSTALL_REGISTRY=0
+export UV_TOOL_DIR="$LM_SYS/uv-tools-$os-$arch"
+export UV_TOOL_BIN_DIR="$LM_BIN"
+export PLAYWRIGHT_BROWSERS_PATH="$LM_SYS/browsers"
+export PATH="$PATH:$LM_BIN"
+unset PYTHONHOME PYTHONPATH
+
+lm_uv_auto=1
+[ -n "${LM_UV:-}" ] && lm_uv_auto=
+: "${LM_UV:=$LM_BIN/uv}"
+: "${LM_PYTHON:=3.12}"
+have_flock=$(command -v flock 2>/dev/null)
+
+say() { printf 'lm: %s\n' "$*" >&2; }
+
+# uv into system/bin: a copy of the uv found on PATH, else the official installer, which then
+# touches neither PATH nor any profile (UV_UNMANAGED_INSTALL: no receipt either).
+get_uv() {
+  mkdir -p "$LM_BIN" || return 1
+  found=$(command -v uv 2>/dev/null)
+  if [ -n "$found" ] && [ -x "$found" ]; then
+    cp "$found" "$LM_BIN/uv" && chmod +x "$LM_BIN/uv"
+    [ -x "$(dirname "$found")/uvx" ] && cp "$(dirname "$found")/uvx" "$LM_BIN/uvx"
+    "$LM_BIN/uv" --version >/dev/null 2>&1 && return 0
+    rm -f "$LM_BIN/uv" "$LM_BIN/uvx"
+  fi
+  say "no uv found, downloading it into system/bin"
+  export UV_UNMANAGED_INSTALL="$LM_BIN" UV_INSTALL_DIR="$LM_BIN" UV_NO_MODIFY_PATH=1
+  if command -v curl >/dev/null 2>&1; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh 1>&2
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- https://astral.sh/uv/install.sh | sh 1>&2
+  else
+    say "neither curl nor wget is installed"
+  fi
+  unset UV_UNMANAGED_INSTALL UV_INSTALL_DIR UV_NO_MODIFY_PATH
+  [ -x "$LM_BIN/uv" ]
+}
+
+# Sets lm_pkg, the argument for uv pip install, and lm_kept when it is a wheel kept in system/wheels.
+package() {
+  lm_pkg= lm_kept=
+  wheels=$LM_SYS/wheels
+  newest=$(ls -t "$wheels"/lightmind-*.whl 2>/dev/null | head -n 1)
+  if [ -n "$newest" ]; then lm_pkg="$newest[tui]" lm_kept=1; return 0; fi
+  # No kept wheel: use what init recorded, one line: KIND SPEC with KIND folder, wheel or requirement.
+  rec=$LM_SYS/state/install-source.txt
+  kind= spec=
+  [ -f "$rec" ] && read -r kind spec < "$rec"
+  spec=${spec%"$(printf '\r')"}
+  case $kind in
+    requirement) lm_pkg=$spec ;;
+    wheel)
+      [ -f "$spec" ] || { say "the lightmind source named in system/state/install-source.txt does not exist on this machine"; say "fix that line, or put a lightmind wheel into system/wheels"; return 1; }
+      mkdir -p "$wheels" && cp "$spec" "$wheels/" && lm_pkg="$wheels/$(basename "$spec")[tui]" ;;
+    folder)
+      [ -f "$spec/pyproject.toml" ] || { say "the lightmind source named in system/state/install-source.txt does not exist on this machine"; say "fix that line, or put a lightmind wheel into system/wheels"; return 1; }
+      mkdir -p "$wheels" && rm -f "$wheels"/lightmind-*.whl
+      "$LM_UV" build --wheel --out-dir "$wheels" "$spec" 1>&2 || return 1
+      newest=$(ls -t "$wheels"/lightmind-*.whl 2>/dev/null | head -n 1)
+      [ -n "$newest" ] && lm_pkg="$newest[tui]" ;;
+    *) say "system/state/install-source.txt is missing or unreadable, so the launcher does not know where lightmind comes from"
+       say "run lm update from an installed lm, or write a line like  requirement lightmind[tui]  into that file"
+       return 1 ;;
+  esac
+  [ -n "$lm_pkg" ]
+}
+
+# The command lines of all processes (ps, else /proc); fails when neither is available.
+procs() {
+  if command -v ps >/dev/null 2>&1 && ps -A -ww -o args= 2>/dev/null; then return 0; fi
+  [ -d /proc/self ] || return 1
+  for f in /proc/[0-9]*/cmdline; do tr '\0' ' ' 2>/dev/null < "$f"; echo; done
+}
+
+# Is nobody running from the runtime of earlier launchers? Those held no lock, so only the process list can say: a
+# command line naming a file below the folder. The pattern goes through the environment so that this check does not
+# match itself. When no process list can be read, nothing is known and the folder counts as in use.
+legacy_free() {
+  list=$(procs) || return 1
+  ! printf '%s\n' "$list" | LM_RT_SEEN="$legacy/" awk 'index($0, ENVIRON["LM_RT_SEEN"]) { found = 1 } END { exit !found }'
+}
+
+# One build at a time: a lock folder holding the pid of its owner; a lock of a dead owner is taken over. $1 is how
+# many seconds to wait for a lock that is held (0: try once). Returns 1 when the lock stayed busy.
+lock_take() {
+  lock=$LM_SYS/build.lock
+  n=0 told=
+  while ! mkdir "$lock" 2>/dev/null; do
+    owner=$(cat "$lock/pid" 2>/dev/null)
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then [ "$(cat "$lock/pid" 2>/dev/null)" = "$owner" ] && rm -rf "$lock"; continue; fi
+    if [ -z "$owner" ] && [ "$n" -ge 3 ]; then rm -rf "$lock"; continue; fi
+    [ "$n" -lt "$1" ] || return 1
+    [ -n "$told" ] || { say "another lm window is building the runtime, waiting for it"; told=1; }
+    n=$((n + 1))
+    sleep 1
+  done
+  printf '%s\n' "$$" > "$lock/pid"
+}
+lock_release() { rm -rf "$LM_SYS/build.lock"; }
+
+# Looks at the files, starts nothing. Sets rt (the runtime to start, if there is a usable one), fresh (it is current:
+# built from what the tree wants now), want (the stamp the tree wants, empty while lm update asked for nothing) and
+# id (the runtime the pointer names). A runtime of the pointer is usable when lm and the marker of THIS tree are there;
+# the marker is written last by the build.
+look() {
+  rt= fresh= id=
+  want=$(cat "$stampf" 2>/dev/null)
+  id=$(cat "$ptr" 2>/dev/null)
+  case $id in r*) ;; *) id= ;; esac
+  case ${id#r} in ''|*[!0-9]*) id= ;; esac
+  if [ -n "$id" ] && [ -x "$rts/$id/bin/lm" ] && [ "$(cat "$rts/$id/lm-root.txt" 2>/dev/null)" = "$LM_HOME" ]; then
+    rt=$rts/$id
+    [ "$(cat "$rt/lm-stamp.txt" 2>/dev/null)" = "$want" ] && fresh=1
+    return 0
+  fi
+  [ -x "$legacy/bin/lm" ] || return 0
+  # The runtime of earlier launchers. Without a marker an old lm update has outdated it: it may run, but it is never
+  # fresh. With the marker of this tree it is fresh as long as lm update asked for nothing. Another marker means a
+  # moved tree: not usable.
+  if [ ! -f "$legacy/lm-root.txt" ]; then rt=$legacy; return 0; fi
+  if [ "$(cat "$legacy/lm-root.txt")" = "$LM_HOME" ]; then
+    rt=$legacy
+    [ -z "$want" ] && fresh=1
+  fi
+  return 0
+}
+
+# Starts the runtime rt with the arguments. The shared flock on its lm-use.lock is taken on file descriptor 9 and
+# inherited by the exec'd lm, so the runtime counts as in use for as long as lm runs. When the lock cannot be had
+# (a cleanup holds it exclusively and is deleting the folder) or lm is gone, the runtime is looked up again, three
+# times at most.
+start() {
+  tries=0
+  while [ "$tries" -lt 3 ]; do
+    if [ -n "$have_flock" ] && [ -f "$rt/lm-use.lock" ]; then
+      if ( : 9< "$rt/lm-use.lock" ) 2>/dev/null; then       # tried in a subshell: a failing redirection of exec ends the shell
+        exec 9< "$rt/lm-use.lock"
+        if flock -sn 9 && [ -x "$rt/bin/lm" ]; then exec "$rt/bin/lm" "$@"; fi
+        exec 9<&-
+      fi
+    elif [ -x "$rt/bin/lm" ]; then
+      exec "$rt/bin/lm" "$@"
+    fi
+    tries=$((tries + 1))
+    sleep 1
+    look
+    [ -n "$rt" ] || break
+  done
+  say "the runtime could not be started. Start lm again."
+  exit 1
+}
+
+# The next free runtime name rN: one more than the highest number in use.
+next_id() {
+  top=0
+  for d in "$rts"/r*; do
+    [ -d "$d" ] || continue
+    num=${d##*/r}
+    case $num in ''|*[!0-9]*) continue ;; esac
+    [ "$num" -gt "$top" ] && top=$num
+  done
+  newid=r$((top + 1))
+  newrt=$rts/$newid
+}
+
+# Removes every runtime that is not the one that runs, not the one the pointer names and in nobody's use; the lock is
+# held, so no build is half way. A folder is in use while any process holds its lm-use.lock: taking the lock
+# exclusively and removing the folder while holding it excludes a starter, which takes it shared. Silent.
+tidy() {
+  if [ -n "$have_flock" ]; then
+    for d in "$rts"/*; do
+      [ -d "$d" ] || continue
+      case $d in "$rt"|"$rts/$id") continue ;; esac
+      if [ -f "$d/lm-use.lock" ]; then
+        ( exec 9< "$d/lm-use.lock" && flock -xn 9 && rm -rf "$d" ) 2>/dev/null
+      elif [ ! -f "$d/lm-root.txt" ]; then
+        rm -rf "$d"                                      # a build that was killed
+      fi
+    done
+  fi
+  if [ -d "$legacy" ] && [ "$rt" != "$legacy" ] && legacy_free; then rm -rf "$legacy" "$legacy.old"; fi
+}
+
+# Cheap look after a start with nothing to build: is there any runtime folder besides the one that runs? Only then
+# the lock is tried (once) and the folders are probed; a busy lock means a build is running, which tidies up itself.
+tidy_soon() {
+  junk=
+  for d in "$rts"/*; do
+    [ -d "$d" ] || continue
+    [ "$d" = "$rt" ] || junk=1
+  done
+  [ -d "$legacy" ] && [ "$rt" != "$legacy" ] && junk=1
+  [ -n "$junk" ] || return 0
+  lock_take 0 || return 0
+  tidy
+  lock_release
+}
+
+# The runtime goes into its folder newrt; the pointer is written last, to a file of its own that is moved over the old
+# pointer (one step for every reader). Stamp first, marker last: the runtime counts as complete with its marker.
+make_runtime() {
+  "$LM_UV" venv --python "$LM_PYTHON" --managed-python "$newrt" 1>&2 || return 1
+  : > "$newrt/lm-use.lock" || return 1
+  # A wheel kept from an earlier build is tried from the cache first, quietly, so a moved tree needs no network.
+  if [ -n "$lm_kept" ] && "$LM_UV" pip install --offline --python "$newrt/bin/python" "$lm_pkg" >/dev/null 2>&1; then
+    :
+  else
+    "$LM_UV" pip install --python "$newrt/bin/python" "$lm_pkg" 1>&2 || return 1
+  fi
+  printf '%s' "$want" > "$newrt/lm-stamp.txt" || return 1
+  printf '%s\n' "$LM_HOME" > "$newrt/lm-root.txt" || return 1
+  printf '%s\n' "$newid" > "$ptr.tmp" && mv -f "$ptr.tmp" "$ptr"
+}
+
+# Drops the partial runtime after a failed build or a signal; the pointer was not touched, so the current stays.
+abort() { trap - INT TERM HUP; rm -rf "$newrt" "$ptr.tmp"; lock_release; exit 1; }
+
+# Builds the next runtime, the lock held, and tidies up. Returns 0 built, 1 failed (the current runtime is untouched).
+build() {
+  next_id
+  say "building runtime $newid in system/runtimes/$os-$arch (first start, a new version or a moved tree)"
+  if [ -n "$lm_uv_auto" ] && [ ! -x "$LM_UV" ]; then get_uv; fi
+  [ -x "$LM_UV" ] || { say "uv is not available and could not be downloaded. Check the network, or put uv into system/bin."; return 1; }
+  package || return 1
+  "$LM_UV" python install "$LM_PYTHON" 1>&2 || return 1
+  mkdir -p "$rts" || return 1
+  trap abort INT TERM HUP                           # from here on a signal drops the partial runtime
+  if ! make_runtime; then
+    trap - INT TERM HUP
+    rm -rf "$newrt" "$ptr.tmp"
+    return 1
+  fi
+  trap - INT TERM HUP
+  look
+  [ "$rt" = "$newrt" ] || { rm -rf "$newrt"; return 1; }
+  tidy
+  say "runtime $newid ready."
+}
+
+look
+if [ -n "$only" ]; then
+  if [ -n "$fresh" ]; then say "the runtime is up to date."; exit 0; fi
+elif [ -n "$fresh" ]; then
+  # Fast path: runtime, marker and stamp are as wanted. No uv call, only a look at the files.
+  [ -z "$lm_uv_auto" ] || [ -x "$LM_UV" ] || get_uv || true
+  tidy_soon
+  start "$@"
+fi
+
+# A new runtime is needed. A start that has a runtime to run does not wait for a build in another window.
+current=
+[ -n "$rt" ] && [ -z "$only" ] && current=1
+wait=${LM_LOCK_WAIT:-300}
+[ -n "$current" ] && wait=0
+if ! lock_take "$wait"; then
+  if [ -n "$current" ]; then
+    say "a new version is being built in another lm window right now. This window starts the current one."
+    start "$@"
+  fi
+  say "the build lock system/build.lock is held for too long. Remove it if no build is running."
+  exit 1
+fi
+# Under the lock: another window may have finished the build meanwhile.
+look
+if [ -n "$fresh" ]; then
+  tidy
+  lock_release
+  if [ -n "$only" ]; then say "the runtime is up to date."; exit 0; fi
+  start "$@"
+fi
+build; rc=$?
+lock_release
+if [ "$rc" -eq 0 ]; then
+  [ -z "$only" ] || exit 0
+  start "$@"
+fi
+if [ -n "$only" ]; then
+  say "the new runtime could not be built. Fix the problem named above and run lm again."
+  exit 1
+fi
+look
+if [ -n "$rt" ]; then
+  say "the new runtime could not be built, this window starts the current one. The next start tries again."
+  start "$@"
+fi
+say "the runtime could not be built. Fix the problem named above and start lm again."
+exit 1

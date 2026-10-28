@@ -1,0 +1,11 @@
+# Launchers keep their line endings whatever git is configured to do.
+src/lightmind/templates/system/lm text eol=lf
+src/lightmind/templates/system/lm.cmd text eol=crlf
+src/lightmind/templates/system/lightmind text eol=lf
+src/lightmind/templates/system/lightmind.cmd text eol=crlf
+src/lightmind/templates/system/lmq text eol=lf
+src/lightmind/templates/system/lmq.cmd text eol=crlf
+src/lightmind/templates/system/lmr text eol=lf
+src/lightmind/templates/system/lmr.cmd text eol=crlf
+# Earlier launchers, kept byte for byte for the test that replaces a launcher under a running window.
+tests/fixtures/old-launchers/* -text

@@ -1,0 +1,20 @@
+# The technical engine stays on this machine and is rebuilt by lm: runtime, Python, caches, the uv
+# program, browsers, Claude logins and the local state. The launchers and the README stay in git, so a
+# copy of the tree can start itself.
+system/*
+!system/lm
+!system/lm.cmd
+!system/lightmind
+!system/lightmind.cmd
+!system/lmq
+!system/lmq.cmd
+!system/lmr
+!system/lmr.cmd
+!system/README.md
+runs/*
+!runs/README.md
+secrets/**/*.env
+secrets/**/*.env.tmp
+*.lokal
+__pycache__/
+*.bak-*

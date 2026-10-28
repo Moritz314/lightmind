@@ -1,0 +1,122 @@
+{
+  "name": "lightmind",
+  "displayName": "Lightmind",
+  "description": "Lightmind chat in the VS Code side bar.",
+  "version": "0.1.11",
+  "publisher": "lightmind",
+  "license": "UNLICENSED",
+  "icon": "media/icon.png",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["AI", "Chat"],
+  "main": "./dist/extension.cjs",
+  "type": "module",
+  "extensionKind": ["workspace"],
+  "activationEvents": [],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Lightmind runs an agent that reads and changes files and runs commands. It is only available in trusted workspaces."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Lightmind needs real files on disk."
+    }
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [{ "id": "lightmind", "title": "Lightmind", "icon": "media/icon.svg" }]
+    },
+    "views": {
+      "lightmind": [{ "type": "webview", "id": "lightmind.chat", "name": "Chat" }]
+    },
+    "commands": [
+      { "command": "lightmind.newSession", "title": "Lightmind: New session", "icon": "$(add)" },
+      { "command": "lightmind.openSession", "title": "Lightmind: Open session...", "icon": "$(history)" },
+      { "command": "lightmind.settings", "title": "Lightmind: Settings", "icon": "$(gear)" },
+      { "command": "lightmind.cancel", "title": "Lightmind: Stop the running turn" },
+      { "command": "lightmind.restart", "title": "Lightmind: Restart backend" },
+      { "command": "lightmind.clearMarks", "title": "Lightmind: Clear marks" },
+      { "command": "lightmind.toggleFollow", "title": "Lightmind: Toggle follow mode" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "lightmind.newSession", "when": "view == lightmind.chat", "group": "navigation@1" },
+        { "command": "lightmind.openSession", "when": "view == lightmind.chat", "group": "navigation@2" },
+        { "command": "lightmind.settings", "when": "view == lightmind.chat", "group": "navigation@3" }
+      ],
+      "commandPalette": [
+        { "command": "lightmind.newSession", "when": "lightmind.active" },
+        { "command": "lightmind.openSession", "when": "lightmind.active" },
+        { "command": "lightmind.settings", "when": "lightmind.active" },
+        { "command": "lightmind.cancel", "when": "lightmind.active" },
+        { "command": "lightmind.restart", "when": "lightmind.active" },
+        { "command": "lightmind.clearMarks", "when": "lightmind.active" },
+        { "command": "lightmind.toggleFollow", "when": "lightmind.active" }
+      ]
+    },
+    "configuration": {
+      "title": "Lightmind",
+      "properties": {
+        "lightmind.home": {
+          "scope": "machine",
+          "type": "string",
+          "default": "~/lightmind",
+          "markdownDescription": "Path of the Lightmind tree (contains `system/runtimes` and `config.md`). On Remote-SSH this is the path on the remote machine."
+        },
+        "lightmind.follow": {
+          "type": "boolean",
+          "default": true,
+          "description": "Follow the agent: open the file it works on in the editor (without taking focus) and briefly highlight changed lines."
+        },
+        "lightmind.followWhere": {
+          "type": "string",
+          "enum": ["side", "active"],
+          "default": "side",
+          "enumDescriptions": [
+            "Open the agent's file in a second editor column; your own editor stays untouched.",
+            "Always show the agent's file in your current editor and jump to the exact lines it changed."
+          ],
+          "description": "Where follow mode shows the file the agent works on."
+        },
+        "lightmind.followSkipLogs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Follow mode never opens logs and run files (runs/, tool-out/, .git, *.log, *.jsonl, log.md)."
+        }
+      }
+    },
+    "colors": [
+      {
+        "id": "lightmind.working",
+        "description": "Marker for files Lightmind is working on right now.",
+        "defaults": { "dark": "#35e0ff", "light": "#006f8c", "highContrast": "#35e0ff", "highContrastLight": "#006f8c" }
+      },
+      {
+        "id": "lightmind.changed",
+        "description": "Marker for files changed by Lightmind.",
+        "defaults": { "dark": "#c586f5", "light": "#7a3fc0", "highContrast": "#d7a6ff", "highContrastLight": "#5a2fa0" }
+      },
+      {
+        "id": "lightmind.changedLine",
+        "description": "Background for lines Lightmind just changed.",
+        "defaults": { "dark": "#35e0ff2e", "light": "#006f8c26", "highContrast": "#35e0ff40", "highContrastLight": "#006f8c33" }
+      }
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node build.mjs",
+    "test:unit": "node --test \"test/*.test.ts\"",
+    "test:web": "node --test test/webview.e2e.mjs test/webview.real.mjs test/webview.longask.mjs",
+    "test": "npm run typecheck && npm run build && npm run test:unit && npm run test:web",
+    "package": "npm run build && vsce package --allow-missing-repository --skip-license -o lightmind.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.25.0",
+    "puppeteer-core": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

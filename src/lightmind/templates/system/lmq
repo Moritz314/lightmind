@@ -1,0 +1,3 @@
+#!/bin/sh
+# Quick chat: `lmq` does the same as `lm q` (no start menu; this device, this folder, defaults of config.md `quick:`).
+exec "$(dirname "$0")/lm" q "$@"

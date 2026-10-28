@@ -1,0 +1,3 @@
+#!/bin/sh
+# Alias: `lightmind` does the same as `lm`.
+exec "$(dirname "$0")/lm" "$@"
